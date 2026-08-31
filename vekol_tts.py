@@ -1,0 +1,238 @@
+#!/usr/bin/env python3
+"""Vekol-TTS — Sorani (Central Kurdish, ckb) text-to-speech, edge build.
+
+Tiny offline voice that runs on CPU (no GPU, no internet after the model is local).
+Model = model.onnx (~77 MB, 22.05 kHz, Piper/VITS). Part of the Vekol hub by Revge.
+
+Usage:
+    python3 vekol_tts.py "ئەمڕۆ کەشەکە خۆشە" out.wav
+    python3 vekol_tts.py            # interactive
+
+Deps:  pip install onnxruntime numpy scipy
+(onnxruntime runs the model; no heavyweight ML deps — the tokenizer is the
+character map shipped in model.onnx.json.)
+
+The model weights (model.onnx) are hosted on Hugging Face: RevgeAI/vekol-tts-ckb-edge.
+If model.onnx isn't next to this script, it's downloaded automatically on first run.
+"""
+import os, re, sys, json, shutil, unicodedata
+from io import BytesIO
+from urllib.request import Request, urlopen
+import numpy as np
+import onnxruntime as ort
+import scipy.io.wavfile
+from scipy.signal import stft, istft
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+HF_REPO = "RevgeAI/vekol-tts-ckb-edge"
+SCALES = [0.667, 1.0, 0.35]  # [noise_scale, length_scale, noise_w] — accurate + natural prosody
+
+
+def _asset(name):
+    local = os.path.join(HERE, name)
+    if os.path.exists(local):
+        return local
+    print(f"{name} not found locally — downloading from {HF_REPO} ...")
+    url = f"https://huggingface.co/{HF_REPO}/resolve/main/{name}?download=true"
+    temporary = f"{local}.download"
+    request = Request(url, headers={"User-Agent": "telegram-sorani-tts/1.0"})
+    with urlopen(request, timeout=180) as response, open(temporary, "wb") as output:
+        shutil.copyfileobj(response, output)
+    os.replace(temporary, local)
+    return local
+
+
+_cfg = json.load(open(_asset("model.onnx.json"), encoding="utf-8"))
+_pm = _cfg["phoneme_id_map"]
+SR = _cfg["audio"]["sample_rate"]
+_sess = ort.InferenceSession(_asset("model.onnx"), providers=["CPUExecutionProvider"])
+PAD, BOS, EOS = _pm["_"][0], _pm["^"][0], _pm["$"][0]
+
+# --- text normalization: fold typed variants onto in-map letters so nothing drops ---
+_NORM = {
+    "ك": "ک",                                   # Arabic kaf -> Sorani keheh
+    "ھ": "ه", "ہ": "ه", "ۀ": "ە", "ة": "ە",     # heh variants / teh-marbuta
+    "ى": "ی", "ﻯ": "ی", "ﺉ": "ئ", "ٸ": "ئ",
+    "ؤ": "و", "أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ڭ": "گ",
+    "‌": "", "‍": "", "ـ": "",         # ZWNJ/ZWJ -> join, tatweel -> drop
+    "“": '"', "”": '"', "’": "'", "‘": "'", "—": "-", "–": "-", "…": ".",
+}
+_DIG = str.maketrans("٠١٢٣٤٥٦٧٨٩۰۱۲۳۴۵۶۷۸۹", "01234567890123456789")
+_ONES = ["", "یەک", "دوو", "سێ", "چوار", "پێنج", "شەش", "حەوت", "هەشت", "نۆ"]
+_TEENS = ["دە", "یازدە", "دوازدە", "سێزدە", "چواردە", "پازدە", "شازدە", "حەڤدە", "هەژدە", "نۆزدە"]
+_TENS = ["", "", "بیست", "سی", "چل", "پەنجا", "شەست", "حەفتا", "هەشتا", "نەوەد"]
+
+
+def _u100(n):
+    if n < 10: return _ONES[n]
+    if n < 20: return _TEENS[n - 10]
+    t, r = _TENS[n // 10], n % 10
+    return t if r == 0 else f"{t} و {_ONES[r]}"
+
+
+def _u1000(n):
+    if n < 100: return _u100(n)
+    h, r = n // 100, n % 100
+    hw = "سەد" if h == 1 else f"{_ONES[h]}سەد"
+    return hw if r == 0 else f"{hw} و {_u100(r)}"
+
+
+def _spell(n):
+    if n == 0: return "سفر"
+    parts = []
+    for div, word in ((1_000_000_000, "ملیار"), (1_000_000, "ملیۆن"), (1000, "هەزار")):
+        if n >= div:
+            q, n = divmod(n, div)
+            parts.append(word if q == 1 else f"{_u1000(q)} {word}")
+    if n: parts.append(_u1000(n))
+    return " و ".join(parts)
+
+
+def normalize(text):
+    text = "".join(_NORM.get(c, c) for c in text).translate(_DIG)
+    return re.sub(r"\d+", lambda m: f" {_spell(int(m.group()))} ", text)
+
+
+def _ids(text):
+    seq = [BOS, PAD]
+    for ch in unicodedata.normalize("NFD", normalize(text)):
+        if ch in _pm:
+            seq += [_pm[ch][0], PAD]
+        elif not unicodedata.combining(ch):
+            sys.stderr.write(f"[warn] dropped '{ch}' U+{ord(ch):04X} (not in map)\n")
+    return np.array([seq + [EOS]], dtype=np.int64)
+
+
+def _denoise(a, reduce_db=16):
+    """Spectral noise-gate: attenuate the vocoder's grainy background hiss. Keeps the
+    audio at its natural scale (no per-chunk normalization) so stitched pieces match level."""
+    _, _, Z = stft(a, SR, nperseg=1024, noverlap=768)
+    mag, ph = np.abs(Z), np.angle(Z)
+    noise = np.percentile(mag, 10, axis=1, keepdims=True)
+    g = 10 ** (-reduce_db / 20)
+    mask = g + (1 - g) * np.clip((mag / (noise + 1e-9) - 1.0) / 2.0, 0, 1)
+    _, y = istft(mag * mask * np.exp(1j * ph), SR, nperseg=1024, noverlap=768)
+    return y[:len(a)]
+
+
+def _trim(a, gap=0.35, edge=0.06, th=0.02):
+    """Drop a trailing blob after a long silence (a hallucinated tail) AND strip the
+    model's own leading/trailing silence, so stitched phrases don't lag. Keeps a short
+    `edge` pad on each side."""
+    env = np.convolve(np.abs(a), np.ones(int(0.02 * SR)) / int(0.02 * SR), "same")
+    loud = env > th * (env.max() or 1)
+    if not loud.any():
+        return a
+    first, last = np.where(loud)[0][[0, -1]]
+    i = last
+    while i > first:
+        if not loud[i]:
+            j = i
+            while j > first and not loud[j]:
+                j -= 1
+            if (i - j) / SR > gap:
+                last = j
+            i = j
+        else:
+            i -= 1
+    lo = max(0, first - int(edge * SR))
+    hi = min(len(a), last + int(edge * SR))
+    return a[lo:hi]
+
+
+RATE = 0.075   # seconds of audio per character for this voice (empirical)
+
+
+def _synth_one(text, tries=2):
+    # VITS duration is stochastic, so a render can occasionally tack on a babble tail.
+    # Babble only ADDS length, so render up to `tries` times and keep the shortest; stop
+    # early once a render is within the length its character count predicts (no babble).
+    cap = len(text) * RATE + 1.2
+    best = None
+    for _ in range(tries):
+        ids = _ids(text)
+        a = _sess.run(None, {
+            "input": ids,
+            "input_lengths": np.array([ids.shape[1]], dtype=np.int64),
+            "scales": np.array(SCALES, dtype=np.float32),
+            "sid": np.array([0], dtype=np.int64),
+        })[0].squeeze()
+        a = _trim(_denoise(a))      # natural scale preserved for seamless stitching
+        if best is None or len(a) < len(best):
+            best = a
+        if len(best) / SR <= cap:   # clean -> no need to re-roll
+            break
+    return best
+
+
+
+
+_CLAUSE = re.compile(r"(?<=[،؛,;:])")   # split AFTER a comma/semicolon (keeps the mark)
+
+
+def _split_long(s, maxlen=70):
+    """A short sentence is read in one natural pass. A long one is broken at its commas
+    into clause-sized chunks <= maxlen. Each chunk is closed with a period so it reads as
+    a COMPLETE utterance: a chunk ending on a comma makes VITS expect more speech and
+    babble to fill it (a ~2s hallucinated tail) — a period tells the model to stop."""
+    if len(s) <= maxlen:
+        return [s]
+    out, buf = [], ""
+    for part in _CLAUSE.split(s):
+        if buf and len(buf) + len(part) > maxlen:
+            out.append(buf); buf = part
+        else:
+            buf += part
+    if buf.strip():
+        out.append(buf)
+    return [c.strip().rstrip("،؛,;:.؟!").strip() + "." for c in out if c.strip()]
+
+
+def speak(text, out="out.wav"):
+    # Split at sentence-final punctuation; long sentences are further split at commas so
+    # no single pass is long enough to trigger VITS's stochastic trailing hallucination.
+    # Sentences get a slightly longer pause than intra-sentence clause joins.
+    sents = [s.strip() for s in re.split(r"[.؟!\n]+", text) if s.strip()] or [text.strip()]
+    sent_gap = np.zeros(int(0.28 * SR), dtype=np.float32)
+    clause_gap = np.zeros(int(0.13 * SR), dtype=np.float32)   # short, natural comma pause
+    pieces = []
+    for si, s in enumerate(sents):
+        chunks = _split_long(s)
+        for ci, c in enumerate(chunks):
+            pieces.append(_synth_one(c))                      # natural scale, short pass
+            if ci < len(chunks) - 1:
+                pieces.append(clause_gap)
+        if si < len(sents) - 1:
+            pieces.append(sent_gap)
+    wav = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+    wav = wav / (np.abs(wav).max() or 1)     # single global normalize -> even loudness
+    scipy.io.wavfile.write(out, SR, (wav * 32767).astype(np.int16))
+    return out, len(wav) / SR
+
+
+def speak_to_buffer(text):
+    """Render Sorani speech directly to an in-memory WAV buffer."""
+    audio_buffer = BytesIO()
+    speak(text, audio_buffer)
+    audio_buffer.seek(0)
+    return audio_buffer
+
+
+if __name__ == "__main__":
+    if len(sys.argv) >= 2:
+        out = sys.argv[2] if len(sys.argv) > 2 else "out.wav"
+        path, dur = speak(sys.argv[1], out)
+        print(f"wrote {path}  ({dur:.1f}s)")
+    else:
+        print("Vekol-TTS (Sorani) — type text, blank line to quit:")
+        n = 1
+        while True:
+            try:
+                t = input("> ").strip()
+            except EOFError:
+                break
+            if not t:
+                break
+            path, dur = speak(t, f"out_{n}.wav")
+            print(f"  wrote {path}  ({dur:.1f}s)")
+            n += 1
