@@ -60,12 +60,14 @@ def ping():
     return "OK", 200
 
 
-def run_health_server() -> None:
+def keep_alive() -> None:
+    """Run the health server without blocking Telegram polling."""
     health_app.run(
         host="0.0.0.0",
         port=PORT,
         debug=False,
         use_reloader=False,
+        threaded=True,
     )
 
 
@@ -147,7 +149,7 @@ async def text_to_speech(
 
 
 def main() -> None:
-    Thread(target=run_health_server, daemon=True).start()
+    Thread(target=keep_alive, name="health-server", daemon=True).start()
 
     app = (
         ApplicationBuilder()
