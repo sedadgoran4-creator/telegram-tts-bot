@@ -2,6 +2,7 @@ import asyncio
 import logging
 from io import BytesIO
 import os
+import time
 from threading import Thread
 
 from edge_tts import Communicate
@@ -148,9 +149,7 @@ async def text_to_speech(
         )
 
 
-def main() -> None:
-    Thread(target=keep_alive, name="health-server", daemon=True).start()
-
+def build_telegram_app():
     app = (
         ApplicationBuilder()
         .token(TOKEN)
@@ -171,7 +170,22 @@ def main() -> None:
             text_to_speech,
         )
     )
-    app.run_polling(drop_pending_updates=True)
+    return app
+
+
+def run_bot_forever() -> None:
+    """Keep Telegram polling alive and retry after unexpected disconnects."""
+    while True:
+        try:
+            build_telegram_app().run_polling(drop_pending_updates=True)
+        except Exception:
+            logger.exception("Telegram bot stopped unexpectedly; retrying soon")
+            time.sleep(5)
+
+
+def main() -> None:
+    Thread(target=keep_alive, name="health-server", daemon=True).start()
+    run_bot_forever()
 
 
 if __name__ == "__main__":
