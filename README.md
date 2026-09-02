@@ -6,7 +6,7 @@ A Telegram bot that converts text messages into audio:
 - Sorani Kurdish messages use the native Vekol Sorani model.
 - `/` and `/ping` expose HTTP health endpoints for monitoring.
 
-## Run locally
+## Run locally or on Zeabur
 
 This project requires Python 3.13.
 
@@ -18,21 +18,43 @@ export TELEGRAM_BOT_TOKEN="your-token"
 python main.py
 ```
 
-Set `PORT` when the hosting provider supplies one. The Sorani model downloads
-automatically from Hugging Face on its first use if `model.onnx` is not already
-present.
+The `Procfile` starts the same service with Gunicorn on `0.0.0.0` and
+`PORT` (default `8080`). The Sorani model downloads automatically from
+Hugging Face on its first use if `model.onnx` is not already present.
 
-## Deploying
+## PythonAnywhere
 
-Run the service with:
+1. Create a Python 3.13 web app.
+2. Clone this repository into the PythonAnywhere account.
+3. Install dependencies in the web app virtualenv:
 
 ```bash
-python main.py
+pip install -r requirements.txt
 ```
 
-The service listens on `PORT` (default `8080`) and uses `/ping` as its health
-check. Keep `TELEGRAM_BOT_TOKEN` in the hosting provider's secret/environment
+4. Add `TELEGRAM_BOT_TOKEN` to the web app environment.
+5. Set the WSGI file to this repository's `wsgi.py`.
+6. Reload the web app.
+
+`wsgi.py` exposes the Flask app and starts one Telegram polling thread. The
+health URL is `/ping`.
+
+## Zeabur
+
+Import this GitHub repository, set `TELEGRAM_BOT_TOKEN` as a secret, and let
+Zeabur use the included `Procfile`. It starts one Gunicorn worker and listens
+on `PORT` (or `8080` when no port is supplied).
+
+Keep `TELEGRAM_BOT_TOKEN` in the hosting provider's secret/environment
 settings; never commit it to the repository.
+
+## Important free-tier limits
+
+The code is free-tier compatible, but hosting uptime depends on the provider:
+PythonAnywhere's free account has restricted outbound Internet access and does
+not provide always-on background tasks. Zeabur's Free Plan auto-sleeps idle
+services. Neither provider guarantees a 24/7 Telegram polling process on its
+free plan.
 
 ## Attribution and license
 
