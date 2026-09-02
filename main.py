@@ -31,7 +31,7 @@ TOKEN = "".join(
 if not TOKEN:
     raise RuntimeError(
         "TELEGRAM_BOT_TOKEN is not configured. "
-        "Add it as a Replit Secret before starting the bot."
+        "Add it as a secret/environment variable before starting the bot."
     )
 
 PORT = int(os.environ.get("PORT", "8080"))
