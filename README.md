@@ -1,9 +1,11 @@
-# Telegram Arabic & Sorani TTS Bot
+# Telegram Multilingual Speech Bot
 
-A Telegram bot that converts text messages into audio:
+A Telegram bot with two-way speech support:
 
 - Arabic messages use the Iraqi male voice `ar-IQ-BasselNeural`.
 - Sorani Kurdish messages use the native Vekol Sorani model.
+- Voice and audio messages are transcribed with multilingual Whisper.
+- Whisper automatically detects Kurdish dialects, Arabic, English, and mixed speech.
 - `/` and `/ping` expose HTTP health endpoints for monitoring.
 
 ## Run locally or on Zeabur
@@ -20,7 +22,10 @@ python main.py
 
 The `Procfile` starts the same service with Gunicorn on `0.0.0.0` and
 `PORT` (default `8080`). The Sorani model downloads automatically from
-Hugging Face on its first use if `model.onnx` is not already present.
+Hugging Face on its first use if `model.onnx` is not already present. The
+Whisper model also downloads automatically from Hugging Face the first time the
+bot receives a voice message. `WHISPER_MODEL_SIZE` defaults to `small` for
+better multilingual accuracy; set it to `base` on a low-memory host.
 
 ## PythonAnywhere
 
@@ -34,10 +39,14 @@ pip install -r requirements.txt
 
 4. Add `TELEGRAM_BOT_TOKEN` to the web app environment.
 5. Set the WSGI file to this repository's `wsgi.py`.
-6. Reload the web app.
+6. (Optional) Add `WHISPER_MODEL_SIZE=base` if the account has limited memory.
+7. Reload the web app.
 
 `wsgi.py` exposes the Flask app and starts one Telegram polling thread. The
 health URL is `/ping`.
+
+Send a voice message or audio file to receive its written transcription. Send
+Arabic, Kurdish, or English text to receive audio as before.
 
 ## Zeabur
 
