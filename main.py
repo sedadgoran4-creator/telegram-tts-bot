@@ -2,8 +2,10 @@ import asyncio
 import logging
 from io import BytesIO
 import os
+from pathlib import Path
+import tempfile
 import time
-from threading import Thread
+from threading import Lock, Thread
 
 from edge_tts import Communicate
 from flask import Flask
@@ -40,8 +42,14 @@ TTS_REQUEST_TIMEOUT = 60
 TTS_TOTAL_TIMEOUT = 180
 TTS_ATTEMPTS = 3
 TTS_CONCURRENCY = 1
+STT_TOTAL_TIMEOUT = 300
+STT_MAX_AUDIO_BYTES = 20 * 1024 * 1024
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "small")
 tts_semaphore = asyncio.Semaphore(TTS_CONCURRENCY)
+stt_semaphore = asyncio.Semaphore(1)
 health_app = Flask(__name__)
+_whisper_model = None
+_whisper_model_lock = Lock()
 
 KURDISH_MARKERS = frozenset("پچژڕڵۆێەڤگ")
 
@@ -49,6 +57,39 @@ KURDISH_MARKERS = frozenset("پچژڕڵۆێەڤگ")
 def is_sorani_text(text: str) -> bool:
     """Route Sorani text to the native Kurdish model."""
     return any(character in KURDISH_MARKERS for character in text)
+
+
+def transcribe_audio_file(audio_path: str) -> tuple[str, str]:
+    """Transcribe multilingual audio with Whisper and return text plus language."""
+    global _whisper_model
+
+    if _whisper_model is None:
+        with _whisper_model_lock:
+            if _whisper_model is None:
+                from faster_whisper import WhisperModel
+
+                logger.info(
+                    "Loading Whisper model %s for multilingual transcription",
+                    WHISPER_MODEL_SIZE,
+                )
+                _whisper_model = WhisperModel(
+                    WHISPER_MODEL_SIZE,
+                    device="cpu",
+                    compute_type="int8",
+                )
+
+    segments, info = _whisper_model.transcribe(
+        audio_path,
+        beam_size=5,
+        vad_filter=True,
+        condition_on_previous_text=False,
+    )
+    transcript = " ".join(
+        segment.text.strip() for segment in segments if segment.text.strip()
+    ).strip()
+    if not transcript:
+        raise RuntimeError("Speech recognition returned no text")
+    return transcript, info.language or "unknown"
 
 
 @health_app.get("/")
@@ -149,6 +190,70 @@ async def text_to_speech(
         )
 
 
+async def voice_to_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Download a Telegram voice/audio message and reply with its transcript."""
+    if not update.message:
+        return
+
+    voice_or_audio = update.message.voice or update.message.audio
+    if not voice_or_audio:
+        return
+
+    file_size = getattr(voice_or_audio, "file_size", None)
+    if file_size and file_size > STT_MAX_AUDIO_BYTES:
+        await update.message.reply_text(
+            "ئەم فایلە زۆر گەورەیە. تکایە دەنگێک بنێرە کە لە ٢٠MB کەمتر بێت."
+        )
+        return
+
+    try:
+        telegram_file = await context.bot.get_file(voice_or_audio.file_id)
+        audio_bytes = await telegram_file.download_as_bytearray()
+        if len(audio_bytes) > STT_MAX_AUDIO_BYTES:
+            await update.message.reply_text(
+                "ئەم فایلە زۆر گەورەیە. تکایە دەنگێک بنێرە کە لە ٢٠MB کەمتر بێت."
+            )
+            return
+
+        with tempfile.NamedTemporaryFile(
+            suffix=".ogg",
+            prefix="telegram-stt-",
+            delete=False,
+        ) as temporary_audio:
+            temporary_audio.write(audio_bytes)
+            audio_path = Path(temporary_audio.name)
+
+        try:
+            async with stt_semaphore:
+                transcript, language = await asyncio.wait_for(
+                    asyncio.to_thread(transcribe_audio_file, str(audio_path)),
+                    timeout=STT_TOTAL_TIMEOUT,
+                )
+        finally:
+            audio_path.unlink(missing_ok=True)
+
+        await update.message.reply_text(
+            f"📝 دەقی دەنگ ({language}):\n\n{transcript}"
+        )
+    except ModuleNotFoundError:
+        logger.exception("Whisper dependency is not installed")
+        await update.message.reply_text(
+            "پێکهاتەی ناسینەوەی دەنگ لەم سێرڤەرەدا دانەمەزراوە. "
+            "تکایە requirements.txt دابمەزرێنە و دووبارە هەوڵ بدە."
+        )
+    except Exception:
+        logger.exception(
+            "Speech-to-text failed for chat %s",
+            update.effective_chat.id if update.effective_chat else "unknown",
+        )
+        await update.message.reply_text(
+            "نەتوانرا دەنگەکە بکرێتە دەق. تکایە دەنگێکی ڕوونتر بنێرە و دووبارە هەوڵ بدە."
+        )
+
+
 def build_telegram_app():
     app = (
         ApplicationBuilder()
@@ -168,6 +273,12 @@ def build_telegram_app():
         MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             text_to_speech,
+        )
+    )
+    app.add_handler(
+        MessageHandler(
+            filters.VOICE | filters.AUDIO,
+            voice_to_text,
         )
     )
     return app
